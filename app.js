@@ -33,6 +33,7 @@
 
   const CACHE_PREFIX = "bh_calendar_cache_v2:";
   const MAX_STALE_MS = 15 * 60 * 1000;
+  const RETRY_DELAYS_MS = [0, 900, 2200, 4500, 8000, 13000];
 
   function monthCacheKey() {
     return `${CACHE_PREFIX}${cursor.getFullYear()}-${pad(cursor.getMonth()+1)}`;
@@ -137,11 +138,10 @@
     }
 
     const url = `${cfg.appsScriptUrl}?start=${encodeURIComponent(isoLocal(start))}&end=${encodeURIComponent(isoLocal(end))}`;
-    const waits = [0, 900, 2200];
     let lastError = null;
 
-    for (let attempt = 0; attempt < waits.length; attempt++) {
-      if (waits[attempt]) await sleep(waits[attempt]);
+    for (let attempt = 0; attempt < RETRY_DELAYS_MS.length; attempt++) {
+      if (RETRY_DELAYS_MS[attempt]) await sleep(RETRY_DELAYS_MS[attempt]);
       if (serial !== requestSerial) return;
 
       try {
@@ -161,7 +161,7 @@
         return;
       } catch (err) {
         lastError = err;
-        console.warn(`Big Head Agenda: tentativa ${attempt + 1} falhou`, err);
+        console.warn(`Big Head Agenda: tentativa ${attempt + 1}/${RETRY_DELAYS_MS.length} falhou`, err);
       }
     }
 
@@ -294,6 +294,30 @@
 
     dayWhatsapp.href = waUrl(`Olá! Vi a agenda no site do Big Head Estúdio e gostaria de consultar disponibilidade para ${formatShort(selectedDate)}.`);
   }
+
+  // Permite nova tentativa manual sem recarregar a página.
+  const retryButton = document.createElement("button");
+  retryButton.type = "button";
+  retryButton.textContent = "Tentar sincronizar novamente";
+  retryButton.style.cssText = "margin-left:10px;border:1px solid #7a6512;background:#171206;color:#ffe77a;border-radius:999px;padding:7px 11px;font:inherit;font-weight:800;cursor:pointer";
+  retryButton.addEventListener("click", () => {
+    retryButton.disabled = true;
+    retryButton.textContent = "Sincronizando…";
+    loadMonth().finally(() => {
+      retryButton.disabled = false;
+      retryButton.textContent = "Tentar sincronizar novamente";
+    });
+  });
+
+  const originalShow = demoBanner.classList.add.bind(demoBanner.classList);
+  const ensureRetryButton = () => {
+    if ((calendarState === "offline" || calendarState === "stale") && !demoBanner.contains(retryButton)) {
+      demoBanner.appendChild(retryButton);
+    }
+  };
+
+  const bannerObserver = new MutationObserver(ensureRetryButton);
+  bannerObserver.observe(demoBanner, { childList:true, characterData:true, subtree:true, attributes:true, attributeFilter:["class"] });
 
   $("#prevMonth").addEventListener("click", () => { cursor = new Date(cursor.getFullYear(), cursor.getMonth()-1, 1); selectedDate = new Date(cursor.getFullYear(), cursor.getMonth(), 1); loadMonth(); });
   $("#nextMonth").addEventListener("click", () => { cursor = new Date(cursor.getFullYear(), cursor.getMonth()+1, 1); selectedDate = new Date(cursor.getFullYear(), cursor.getMonth(), 1); loadMonth(); });
