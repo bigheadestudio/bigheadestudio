@@ -28,6 +28,50 @@
   let events = [];
   let selectedSlot = null;
   let requestSerial = 0;
+  let calendarState = "loading"; // loading | live | stale | offline
+  let lastSyncAt = null;
+
+  const CACHE_PREFIX = "bh_calendar_cache_v2:";
+  const MAX_STALE_MS = 15 * 60 * 1000;
+
+  function monthCacheKey() {
+    return `${CACHE_PREFIX}${cursor.getFullYear()}-${pad(cursor.getMonth()+1)}`;
+  }
+
+  function saveMonthCache(items) {
+    try {
+      localStorage.setItem(monthCacheKey(), JSON.stringify({
+        savedAt: Date.now(),
+        events: items.map(e => ({ start: e.start.toISOString(), end: e.end.toISOString() }))
+      }));
+    } catch (_) {}
+  }
+
+  function loadMonthCache() {
+    try {
+      const raw = localStorage.getItem(monthCacheKey());
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || !Array.isArray(parsed.events) || !parsed.savedAt) return null;
+      return {
+        savedAt: Number(parsed.savedAt),
+        events: parsed.events.map(e => ({ start: new Date(e.start), end: new Date(e.end) }))
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  function syncAgeLabel(ts) {
+    if (!ts) return "";
+    const mins = Math.max(0, Math.round((Date.now() - ts) / 60000));
+    if (mins <= 1) return "há cerca de 1 minuto";
+    return `há cerca de ${mins} minutos`;
+  }
 
   // Bloqueios apenas para a prévia visual quando a integração ainda não foi configurada.
   function getDemoEvents(year, month) {
@@ -55,15 +99,21 @@
     return new Promise((resolve, reject) => {
       const callback = `bhCalendarCallback_${Date.now()}_${Math.floor(Math.random()*100000)}`;
       const script = document.createElement("script");
+      let settled = false;
       const timeout = setTimeout(() => cleanup(new Error("Tempo de resposta excedido")), 12000);
+
       function cleanup(error, data) {
+        if (settled) return;
+        settled = true;
         clearTimeout(timeout);
-        delete window[callback];
+        try { delete window[callback]; } catch (_) { window[callback] = undefined; }
         script.remove();
         error ? reject(error) : resolve(data);
       }
+
       window[callback] = data => cleanup(null, data);
       script.onerror = () => cleanup(new Error("Falha ao carregar agenda"));
+      script.referrerPolicy = "no-referrer";
       script.src = `${url}${url.includes("?") ? "&" : "?"}callback=${callback}&_=${Date.now()}`;
       document.head.appendChild(script);
     });
@@ -74,33 +124,68 @@
     const start = new Date(cursor.getFullYear(), cursor.getMonth(), 1, 0, 0, 0);
     const end = new Date(cursor.getFullYear(), cursor.getMonth()+1, 1, 0, 0, 0);
 
+    calendarState = "loading";
+
     if (!cfg.appsScriptUrl) {
+      calendarState = "offline";
+      demoBanner.textContent = "Agenda temporariamente indisponível. Consulte o estúdio pelo WhatsApp.";
       demoBanner.classList.add("visible");
-      events = getDemoEvents(cursor.getFullYear(), cursor.getMonth());
+      events = [];
       renderCalendar();
       renderSelectedDay();
       return;
     }
 
-    demoBanner.classList.remove("visible");
-    try {
-      const url = `${cfg.appsScriptUrl}?start=${encodeURIComponent(isoLocal(start))}&end=${encodeURIComponent(isoLocal(end))}`;
-      const data = await jsonp(url);
+    const url = `${cfg.appsScriptUrl}?start=${encodeURIComponent(isoLocal(start))}&end=${encodeURIComponent(isoLocal(end))}`;
+    const waits = [0, 900, 2200];
+    let lastError = null;
+
+    for (let attempt = 0; attempt < waits.length; attempt++) {
+      if (waits[attempt]) await sleep(waits[attempt]);
       if (serial !== requestSerial) return;
-      if (!data || data.ok !== true || !Array.isArray(data.events)) {
-        throw new Error(data && data.error ? data.error : "Resposta inválida do Apps Script");
+
+      try {
+        const data = await jsonp(url);
+        if (serial !== requestSerial) return;
+        if (!data || data.ok !== true || !Array.isArray(data.events)) {
+          throw new Error(data && data.error ? data.error : "Resposta inválida do Apps Script");
+        }
+
+        events = data.events.map(e => ({ start:new Date(e.start), end:new Date(e.end) }));
+        calendarState = "live";
+        lastSyncAt = Date.now();
+        saveMonthCache(events);
+        demoBanner.classList.remove("visible");
+        renderCalendar();
+        renderSelectedDay();
+        return;
+      } catch (err) {
+        lastError = err;
+        console.warn(`Big Head Agenda: tentativa ${attempt + 1} falhou`, err);
       }
-      events = data.events.map(e => ({start:new Date(e.start), end:new Date(e.end)}));
-      renderCalendar();
-      renderSelectedDay();
-    } catch (err) {
-      console.error("Big Head Agenda:", err);
-      demoBanner.textContent = `Agenda indisponível: ${err && err.message ? err.message : "falha de conexão"}. Verifique a implantação do Google Apps Script.`;
-      demoBanner.classList.add("visible");
-      events = [];
-      renderCalendar();
-      renderSelectedDay();
     }
+
+    if (serial !== requestSerial) return;
+
+    const cached = loadMonthCache();
+    const cacheAge = cached ? Date.now() - cached.savedAt : Infinity;
+
+    if (cached && cacheAge <= MAX_STALE_MS) {
+      events = cached.events;
+      calendarState = "stale";
+      lastSyncAt = cached.savedAt;
+      demoBanner.textContent = `Conexão instável com a agenda. Exibindo a última sincronização válida (${syncAgeLabel(lastSyncAt)}). A reserva continua sujeita à confirmação pelo WhatsApp.`;
+      demoBanner.classList.add("visible");
+    } else {
+      events = [];
+      calendarState = "offline";
+      lastSyncAt = cached ? cached.savedAt : null;
+      demoBanner.textContent = `Agenda temporariamente indisponível${lastError && lastError.message ? `: ${lastError.message}` : ""}. Nenhum horário será exibido como livre até a sincronização voltar. Consulte pelo WhatsApp.`;
+      demoBanner.classList.add("visible");
+    }
+
+    renderCalendar();
+    renderSelectedDay();
   }
 
   function dayOpenHours(date) {
@@ -124,6 +209,9 @@
   }
 
   function dayStatus(date) {
+    if (calendarState === "offline" || calendarState === "loading") {
+      return {kind:"unknown", label:"Indisponível"};
+    }
     const slots = slotsForDay(date);
     if (!slots.length) return {kind:"full", label:"Fechado"};
     const reserved = slots.filter(s=>s.reserved).length;
@@ -169,6 +257,12 @@
     selectedSlot = null;
     slotsEl.innerHTML = "";
 
+    if (calendarState === "offline" || calendarState === "loading") {
+      dateSubtitle.textContent = "A disponibilidade não pôde ser confirmada agora.";
+      dayWhatsapp.href = waUrl(`Olá! A agenda do site está temporariamente indisponível e gostaria de consultar os horários de ${formatShort(selectedDate)} para ensaio.`);
+      return;
+    }
+
     if (!hours) {
       dateSubtitle.textContent = "Estúdio fechado nesta data.";
       dayWhatsapp.href = waUrl(`Olá! Vi o site do Big Head Estúdio e gostaria de consultar uma possibilidade de horário em ${formatShort(selectedDate)}.`);
@@ -177,7 +271,9 @@
 
     const slots = slotsForDay(selectedDate);
     const availableCount = slots.filter(s=>!s.reserved).length;
-    dateSubtitle.textContent = `${availableCount} horário${availableCount===1?"":"s"} livre${availableCount===1?"":"s"} nesta data.`;
+    dateSubtitle.textContent = calendarState === "stale"
+      ? `${availableCount} horário${availableCount===1?"":"s"} livre${availableCount===1?"":"s"} na última sincronização (${syncAgeLabel(lastSyncAt)}).`
+      : `${availableCount} horário${availableCount===1?"":"s"} livre${availableCount===1?"":"s"} nesta data.`;
 
     slots.forEach(slot => {
       const btn = document.createElement("button");
